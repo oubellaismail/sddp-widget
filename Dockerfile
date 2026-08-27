@@ -12,13 +12,13 @@
 #   docker buildx imagetools inspect cgr.dev/chainguard/node:latest-dev
 
 # --- build: install production deps from the committed lockfile (build once).
-FROM cgr.dev/chainguard/node@sha256:f33e85c75e96cac9c0cc934c630164b78a1600fc30a519afa26e9204352e34af AS build
+FROM cgr.dev/chainguard/node@sha256:87c646948c4ee39b8b2abcb6e6e77008bedc1cbfec41a0c75ddca1a74ec3b691 AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
 # --- runtime: minimal Chainguard node, non-root (uid 65532), no shell / package managers.
-FROM cgr.dev/chainguard/node@sha256:7740ce8ef7cce4b0892e85813cbb39abe48c56bd48290cb18b9ea721480263f3
+FROM cgr.dev/chainguard/node@sha256:3cf2a28e10607bd6758a4e56fbd5580ab9d041f2126e4e79ae50af29f9317f54
 WORKDIR /app
 COPY --from=build /app/node_modules ./node_modules
 COPY src ./src
