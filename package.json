@@ -1,0 +1,16 @@
+{
+  "name": "sddp-service",
+  "version": "0.1.0",
+  "private": true,
+  "description": "SDDP service — generated from sddp-service-template (the paved road).",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}

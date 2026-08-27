@@ -1,0 +1,150 @@
+# PR CI gate — single image, source at the repo root.
+#
+# Nothing to substitute: the image name is derived at runtime from the repository
+# name (ghcr.io/<owner>/<repo>). Name your repo `sddp-<service>` and everything
+# follows automatically.
+#
+# Whole-repo static jobs (secret scan, SAST) run once; the per-image jobs (SCA,
+# Dockerfile lint, build + image scan + publish) run for this repo's single
+# image. The expensive build + image scan runs only after every static check
+# passes, so a build is never wasted on code that would have failed anyway.
+# Nothing publishes until the whole gate is green — publication is strictly
+# post-gate.
+#
+# Each job is a separate status check; making them required is done in the repo's
+# branch-protection ruleset, not here (see README). Actions are pinned to commit
+# SHAs so a moved tag can't swap an action out from under us.
+
+name: CI (PR gate)
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Secret scan — the un-bypassable twin of the local pre-commit hook.
+  secret-scan:
+    name: Secret scan (Gitleaks)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read # gitleaks-action lists the PR's commits via the API
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0 # full history so all commits on the PR are scanned
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Static analysis (source-level insecure patterns), whole repo.
+  sast:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Semgrep scan
+        run: semgrep scan --config p/default --config p/security-audit --error
+
+  # Dependency scan of the service's dependency tree.
+  sca:
+    name: SCA — Dependency-Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Cache NVD data
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.dependency-check
+          key: depcheck-nvd-${{ runner.os }}
+      - name: Dependency-Check
+        uses: dependency-check/Dependency-Check_Action@75ba02d6183445fe0761d26e836bde58b1560600 # 1.1.0
+        with:
+          project: ${{ github.event.repository.name }}
+          path: .
+          format: HTML
+          args: >-
+            --failOnCVSS 7
+            --nvdApiKey ${{ secrets.NVD_API_KEY }}
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dependency-check-report
+          path: reports
+
+  # Dockerfile lint.
+  dockerfile-lint:
+    name: Dockerfile lint — Hadolint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
+        with:
+          dockerfile: Dockerfile
+
+  # Build once + image scan + publish, gated behind all static checks. Build once
+  # and promote by digest: the image Trivy scans is the same image we push.
+  build-scan:
+    name: Build + scan + publish — Trivy
+    needs: [secret-scan, sast, sca, dockerfile-lint]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push the scanned digest to the staging registry (GHCR)
+    env:
+      # Image name = ghcr.io/<owner>/<repo-name>, resolved at runtime.
+      IMAGE: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build image (once)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: . # repo root
+          push: false # publication is post-gate (step below)
+          load: true # load into the runner's docker daemon so Trivy can scan it
+          tags: ${{ env.IMAGE }}:ci
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true # don't block on CVEs with no available fix
+          exit-code: "1" # findings fail the job and block the gate
+          vuln-type: os,library
+
+      # Publish to the staging registry (GHCR). Runs only on the pass path (Trivy's
+      # exit-code:1 fails the job, so a failing gate publishes nothing). The image
+      # is unsigned here — staging only; the cluster pulls from the production
+      # registry, never staging. The release workflow later signs this digest and
+      # copies it to production.
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push scanned digest to staging
+        env:
+          # Tag by the real commit (head.sha); on pull_request github.sha is a
+          # throwaway test-merge. The digest below is the true content identity.
+          TAG: sha-${{ github.event.pull_request.head.sha }}
+        run: |
+          docker tag "${IMAGE}:ci" "$IMAGE:$TAG"
+          docker push "$IMAGE:$TAG"
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE:$TAG")
+          echo "**Published to staging (unsigned):**" >> "$GITHUB_STEP_SUMMARY"
+          echo "- tag: \`$IMAGE:$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- digest: \`$DIGEST\`" >> "$GITHUB_STEP_SUMMARY"

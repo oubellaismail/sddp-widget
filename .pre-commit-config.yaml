@@ -1,0 +1,15 @@
+# Pre-commit hooks — prevent-early secret scanning.
+#
+# This is the LOCAL, prevent-early layer: it catches secrets before a commit is
+# even created, so nothing leaks into Git history. It is bypassable by design
+# (`git commit --no-verify`, or a dev who never ran `pre-commit install`) — the
+# enforceable, un-bypassable backstop is the CI secret scan on the pull request
+# (see .github/workflows/ci.yml). Together they are the prevent-early /
+# enforce-late pair for leaked credentials.
+#
+# Install once per clone:  pre-commit install   (see README)
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks

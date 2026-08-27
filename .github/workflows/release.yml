@@ -1,0 +1,253 @@
+# Release — sign & promote (runs post-merge). Single image.
+#
+# Nothing to substitute: image name = ghcr.io/<owner>/<repo>, and the config-repo
+# path is derived from the repo name (manifests/<slug>/, slug = repo minus the
+# `sddp-` prefix). Name your repo `sddp-<service>` and it all follows.
+#
+# On merge to main, the exact image built and scanned on the PR is signed and
+# promoted — never rebuilt. Trust acts happen only here, after the full gate:
+# signing earlier would certify trust not yet earned.
+#
+# Flow: resolve the scanned digest -> SBOM -> keyless sign + attest -> copy the
+# signed digest (with signature + attestations) from staging (GHCR) to production
+# (DOCR), then verify. Staging holds unsigned build/scan artifacts; production
+# receives only signed digests and is the only registry the cluster pulls from.
+#
+# Keyless signing (Sigstore): this workflow's OIDC identity gets a short-lived
+# Fulcio cert; the signing event is logged in Rekor. The cluster verifies this
+# identity at admission — the signer subject this produces is:
+#
+#     issuer:  https://token.actions.githubusercontent.com
+#     subject: https://github.com/<owner>/<this-repo>/.github/workflows/release.yml@refs/heads/main
+#
+# That exact subject must be added to the platform's trusted-signer allowlist
+# (and enforcing) BEFORE the config-bump PR below is merged, or admission is
+# fail-closed and rejects the new-signer digest. See README, "Wire-up". Keep this
+# workflow's filename/ref stable — the subject is pinned exactly. Actions are
+# pinned to commit SHAs so a moved tag can't swap an action out.
+
+name: Release (sign & promote)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      head_sha:
+        description: "Commit SHA whose staging image to sign/promote (defaults to auto-resolving from the merge commit's PR)"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sign-promote:
+    name: Sign & promote to production registry
+    # Skip the template-generation "Initial commit" (nothing built/signed yet);
+    # real releases run on merged-PR pushes. The no-PR guard below is the backstop
+    # for any other direct push to main.
+    if: github.event.head_commit.message != 'Initial commit'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10 # hard ceiling — a hung verify/copy can't burn the runner
+    outputs:
+      head_sha: ${{ steps.digest.outputs.head_sha }}
+      digest: ${{ steps.digest.outputs.digest }}
+    permissions:
+      contents: read
+      packages: write # read the staging image + write signature/attestation artifacts alongside it
+      id-token: write # keyless OIDC signing (Fulcio short-lived cert)
+      pull-requests: read # resolve the merge commit's PR -> head SHA
+    env:
+      # Registries + repo, resolved at runtime from the repo name.
+      STAGING: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
+      PROD: registry.digitalocean.com/sddp-registry/${{ github.event.repository.name }}
+    steps:
+      - name: Log in to staging registry (GHCR)
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Resolve the exact digest built + scanned on the PR. A merge/squash makes a
+      # new commit SHA, so github.sha won't match the PR's `sha-<head>` tag —
+      # recover the head SHA from the merge commit's associated PR, then look up
+      # the immutable digest for that tag. No rebuild.
+      - name: Resolve scanned digest
+        id: digest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          MERGE_SHA: ${{ github.sha }}
+          INPUT_SHA: ${{ github.event.inputs.head_sha }}
+        run: |
+          HEAD_SHA="$INPUT_SHA"
+          if [ -z "$HEAD_SHA" ]; then
+            PR=$(gh api "repos/$REPO/commits/$MERGE_SHA/pulls" --jq '.[0].number // empty')
+            if [ -z "$PR" ]; then
+              echo "No PR associated with $MERGE_SHA — nothing to promote." >&2
+              exit 1
+            fi
+            HEAD_SHA=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha')
+          fi
+          DIGEST=$(docker buildx imagetools inspect "$STAGING:sha-$HEAD_SHA" --format '{{.Manifest.Digest}}')
+          {
+            echo "ref=$STAGING@$DIGEST"
+            echo "digest=$DIGEST"
+            echo "head_sha=$HEAD_SHA"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved $STAGING:sha-$HEAD_SHA -> $DIGEST"
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Install ORAS
+        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+
+      - name: Generate SBOM (Syft)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ steps.digest.outputs.ref }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      # Sign + attest in staging first, so only a signed artifact is ever promoted.
+      - name: Sign (keyless) + attest SBOM
+        env:
+          COSIGN_YES: "true" # non-interactive: consent to Rekor transparency-log entry
+          STAGING_REF: ${{ steps.digest.outputs.ref }}
+        run: |
+          cosign sign "$STAGING_REF"
+          cosign attest --type spdxjson --predicate sbom.spdx.json "$STAGING_REF"
+
+      - name: Log in to production registry (DOCR)
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: registry.digitalocean.com
+          username: ${{ secrets.DOCR_TOKEN }} # DOCR uses the API token as both username and password
+          password: ${{ secrets.DOCR_TOKEN }}
+
+      # Promote the signed artifact to production, digest-preserving. `oras cp -r`
+      # copies the image together with its referrers (signature + SBOM attestation)
+      # in one graph copy. Because we sign in staging first and copy afterwards, an
+      # unsigned image is never promoted.
+      - name: Promote — copy signed image to production
+        env:
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          DST_TAG: sha-${{ steps.digest.outputs.head_sha }}
+        run: |
+          oras cp -r "$STAGING@$DIGEST" "$PROD:$DST_TAG"
+
+      # Verify the signature + SBOM attestation against the staging ref (content-
+      # addressed to the digest and copied verbatim to production), then confirm
+      # presence in production with a plain manifest fetch. `timeout` guards against
+      # a wedged verification.
+      - name: Verify signature + SBOM attestation
+        env:
+          STAGING_REF: ${{ steps.digest.outputs.ref }}
+          PROD_REF: ${{ env.PROD }}@${{ steps.digest.outputs.digest }}
+        run: |
+          IDENTITY_FLAGS=(
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/release.yml@"
+          )
+          timeout 120 cosign verify "${IDENTITY_FLAGS[@]}" "$STAGING_REF"
+          timeout 120 cosign verify-attestation --type spdxjson "${IDENTITY_FLAGS[@]}" "$STAGING_REF" > /dev/null
+          oras manifest fetch "$PROD_REF" > /dev/null # confirm the signed image is present in production
+          echo "**Promoted (signed):** \`$PROD_REF\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # Open a pull request against the project config repo bumping this service's
+  # deployment to the digest just signed + promoted. PR, never a direct push: a
+  # human merges it, and Argo CD then rolls the new digest into the cluster. This
+  # job holds the pipeline's only cross-repo write credential — a short-lived
+  # GitHub App installation token scoped to just the config repo. It cannot merge.
+  update-config:
+    name: Open config-repo PR (digest bump)
+    needs: sign-promote
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {} # zero authority over this repo; all writes go via the App token
+    env:
+      CONFIG_REPO: ${{ github.repository_owner }}/sddp-app-config
+      IMAGE_NAME: ${{ github.event.repository.name }}
+      SOURCE_SHA: ${{ needs.sign-promote.outputs.head_sha }}
+      DIGEST: ${{ needs.sign-promote.outputs.digest }}
+    steps:
+      - name: Mint GitHub App token (config repo)
+        id: apptoken
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.CONFIG_BOT_APP_ID }}
+          private-key: ${{ secrets.CONFIG_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: sddp-app-config
+
+      - name: Checkout config repo
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ env.CONFIG_REPO }}
+          token: ${{ steps.apptoken.outputs.token }}
+
+      - name: Bump service digest + open PR
+        env:
+          GH_TOKEN: ${{ steps.apptoken.outputs.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # slug = image name minus the `sddp-` prefix; the config repo lays
+          # deployments out under manifests/<slug>/.
+          SLUG="${IMAGE_NAME#sddp-}"
+          DEPLOY="manifests/${SLUG}/deployment.yaml"
+          # First onboarding: the delivery manifest doesn't exist yet. Don't fail —
+          # the sign+promote already succeeded; surface the digest so a maintainer
+          # can seed manifests/<slug>/ from the onboarding template with it.
+          if [ ! -f "$DEPLOY" ]; then
+            echo "No manifest ($DEPLOY) yet — first onboarding. Seed it with this signed digest:"
+            echo "  ${IMAGE_NAME}@${DIGEST}"
+            {
+              echo "**First release — nothing to bump yet.**"
+              echo "Signed + promoted \`${IMAGE_NAME}@${DIGEST}\`."
+              echo "Create \`${DEPLOY}\` from the onboarding template with this digest to go live."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          NEWHEX="${DIGEST#sha256:}"
+          sed -i -E "s#(${IMAGE_NAME}@sha256:)[0-9a-f]{64}#\1${NEWHEX}#" "$DEPLOY"
+
+          if git diff --quiet -- "$DEPLOY"; then
+            echo "Config already at ${NEWHEX:0:12} — no PR needed."
+            echo "**No change:** config already at the promoted digest." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          BRANCH="bump-${SLUG}-${NEWHEX:0:12}"
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "Branch ${BRANCH} already exists — PR presumably open; skipping."
+            exit 0
+          fi
+
+          git config user.name  "sddp-release[bot]"
+          git config user.email "sddp-release[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          git commit -am "chore: bump ${IMAGE_NAME} image to ${NEWHEX:0:12}"
+          git push origin "$BRANCH"
+
+          BODY=$(printf '%s\n' \
+            "Automated digest bump from the ${IMAGE_NAME} release pipeline." \
+            "" \
+            "- **Image:** \`${IMAGE_NAME}@${DIGEST}\`" \
+            "- **Source commit:** \`${SOURCE_SHA}\`" \
+            "- **Release run:** ${RUN_URL}" \
+            "" \
+            "Scanned, keyless-signed and promoted to the production registry by that run; the cluster verifies the signature at admission. Review and merge to deploy via Argo CD.")
+
+          gh pr create --repo "$CONFIG_REPO" --base main --head "$BRANCH" \
+            --title "chore: bump ${IMAGE_NAME} image to ${NEWHEX:0:12}" \
+            --body "$BODY"
+
+          echo "**Opened config PR** bumping ${IMAGE_NAME} to ${NEWHEX:0:12}." >> "$GITHUB_STEP_SUMMARY"
